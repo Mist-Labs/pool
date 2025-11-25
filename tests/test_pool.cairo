@@ -1,454 +1,734 @@
+use starknet::SyscallResultTrait;
+use core::hash::HashStateTrait;
 use core::num::traits::Zero;
+use core::option::OptionTrait;
+use core::pedersen::PedersenTrait;
+use core::poseidon::PoseidonTrait;
 use openzeppelin::token::erc20::interface::{IERC20Dispatcher, IERC20DispatcherTrait};
-use pool::interface::{IBridgePoolDispatcher, IBridgePoolDispatcherTrait};
-use snforge_std::{
-    CheatSpan, ContractClassTrait, DeclareResultTrait, declare, start_cheat_caller_address,
-    stop_cheat_caller_address,
+use pool::interface::{IShieldedPoolDispatcher, IShieldedPoolDispatcherTrait};
+use pool::fast_shielded_pool::FastPool;
+use pool::fast_shielded_pool::FastPool::{
+    Deposit, EmergencyWithdraw, Event, HTLCCreated, TokenAdded, TokenRemoved, Withdrawal,
 };
-use starknet::{ContractAddress, SyscallResultTrait, contract_address_const, get_contract_address};
+use snforge_std::{
+    ContractClassTrait, DeclareResultTrait, EventSpy, EventSpyAssertionsTrait, EventSpyTrait,
+    declare, spy_events, start_cheat_block_timestamp, start_cheat_caller_address,
+    stop_cheat_block_timestamp, stop_cheat_caller_address,
+};
+use starknet::{ContractAddress, contract_address_const, get_block_timestamp};
 
-
-fn deploy_mock_token(recipient: ContractAddress, supply: u256) -> ContractAddress {
-    let contract = declare("ERC20").unwrap_syscall().contract_class();
-    let args = array![recipient.into(), supply.low.into(), supply.high.into()];
+fn deploy_mock_token(recipient: ContractAddress, _supply: u256) -> ContractAddress {
+    let contract = declare("VeilToken").unwrap_syscall().contract_class();
+    let args = array![recipient.into()]; 
     let (contract_address, _) = contract.deploy(@args).unwrap_syscall();
     contract_address
 }
 
-fn deploy_pool(
-    owner: ContractAddress, token: ContractAddress, max_single_lock: u256,
-) -> IBridgePoolDispatcher {
-    let contract = declare("Pool").unwrap_syscall().contract_class();
-    let args = array![
-        owner.into(), token.into(), max_single_lock.low.into(), max_single_lock.high.into(),
-    ];
+fn deploy_pool(owner: ContractAddress) -> IShieldedPoolDispatcher {
+    let contract = declare("FastPool").unwrap_syscall().contract_class();
+    let args = array![owner.into()];
     let (pool_address, _) = contract.deploy(@args).unwrap_syscall();
-    IBridgePoolDispatcher { contract_address: pool_address }
+    IShieldedPoolDispatcher { contract_address: pool_address }
+}
+
+fn generate_commitment(amount: u256, blinding: felt252) -> felt252 {
+    PedersenTrait::new(0).update(amount.low.into()).update(blinding).finalize()
+}
+
+fn generate_hash_lock(secret: felt252) -> felt252 {
+    PoseidonTrait::new().update(secret).finalize()
 }
 
 #[test]
 fn test_pool_deployment_success() {
     let owner = contract_address_const::<0x123>();
-    let token = deploy_mock_token(owner, 1000000_u256);
-    let max_lock = 10000_u256;
-
-    let pool = deploy_pool(owner, token, max_lock);
+    let pool = deploy_pool(owner);
 
     assert(pool.contract_address.is_non_zero(), 'Pool not deployed');
-    assert(pool.get_max_lock() == max_lock, 'Wrong max lock');
-    assert(pool.get_balance() == 0, 'Initial balance not zero');
+    assert(pool.get_current_root() == 0, 'Wrong initial merkle root');
 }
 
-
 #[test]
-fn test_lock_for_htlc_success() {
+fn test_add_supported_token_success() {
     let owner = contract_address_const::<0x123>();
-    let htlc = contract_address_const::<0x456>();
-    let initial_supply = 100000_u256;
-    let lock_amount = 1000_u256;
-    let max_lock = 10000_u256;
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(owner, 1000000_u256);
 
-    let token = deploy_mock_token(owner, initial_supply);
-    let pool = deploy_pool(owner, token, max_lock);
-
-    let token_dispatcher = IERC20Dispatcher { contract_address: token };
-    start_cheat_caller_address(token, owner);
-    token_dispatcher.transfer(pool.contract_address, initial_supply);
-    stop_cheat_caller_address(token);
-
-    assert(pool.get_balance() == initial_supply, 'Wrong pool balance');
+    let mut spy = spy_events();
 
     start_cheat_caller_address(pool.contract_address, owner);
-    pool.lock_for_htlc(htlc, lock_amount);
+    pool.add_supported_token(token);
     stop_cheat_caller_address(pool.contract_address);
 
-    assert(pool.get_balance() == initial_supply - lock_amount, 'Wrong pool balance after lock');
-    assert(token_dispatcher.balance_of(htlc) == lock_amount, 'HTLC didnt receive tokens');
-}
+    assert(pool.is_token_supported(token), 'Token not added');
 
-#[test]
-fn test_pool_deployment_validates_inputs() {
-    let owner = contract_address_const::<0x123>();
-    let token = deploy_mock_token(owner, 1000_u256);
-    let pool = deploy_pool(owner, token, 1000_u256);
-
-    assert(pool.contract_address.is_non_zero(), 'Valid deployment failed');
-}
-
-
-#[test]
-#[should_panic(expected: 'Caller is not the owner')]
-fn test_lock_for_htlc_not_owner() {
-    let owner = contract_address_const::<0x123>();
-    let non_owner = contract_address_const::<0x999>();
-    let htlc = contract_address_const::<0x456>();
-    let lock_amount = 1000_u256;
-    let max_lock = 10000_u256;
-
-    let token = deploy_mock_token(owner, 100000_u256);
-    let pool = deploy_pool(owner, token, max_lock);
-
-    // Non-owner tries to lock
-    start_cheat_caller_address(pool.contract_address, non_owner);
-    pool.lock_for_htlc(htlc, lock_amount);
-}
-
-#[test]
-#[should_panic(expected: 'Invalid HTLC address')]
-fn test_lock_for_htlc_zero_htlc() {
-    let owner = contract_address_const::<0x123>();
-    let htlc = contract_address_const::<0x0>();
-    let lock_amount = 1000_u256;
-    let max_lock = 10000_u256;
-
-    let token = deploy_mock_token(owner, 100000_u256);
-    let pool = deploy_pool(owner, token, max_lock);
-
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.lock_for_htlc(htlc, lock_amount);
-}
-
-
-#[test]
-#[should_panic(expected: 'Amount must be positive')]
-fn test_lock_for_htlc_zero_amount() {
-    let owner = contract_address_const::<0x123>();
-    let htlc = contract_address_const::<0x456>();
-    let lock_amount = 0_u256;
-    let max_lock = 10000_u256;
-
-    let token = deploy_mock_token(owner, 100000_u256);
-    let pool = deploy_pool(owner, token, max_lock);
-
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.lock_for_htlc(htlc, lock_amount);
-}
-
-#[test]
-#[should_panic(expected: 'Exceeds max lock amount')]
-fn test_lock_for_htlc_exceeds_max() {
-    let owner = contract_address_const::<0x123>();
-    let htlc = contract_address_const::<0x456>();
-    let max_lock = 10000_u256;
-    let lock_amount = 15000_u256; // Exceeds max
-
-    let token = deploy_mock_token(owner, 100000_u256);
-    let pool = deploy_pool(owner, token, max_lock);
-
-    let token_dispatcher = IERC20Dispatcher { contract_address: token };
-    start_cheat_caller_address(token, owner);
-    token_dispatcher.transfer(pool.contract_address, 50000_u256);
-    stop_cheat_caller_address(token);
-
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.lock_for_htlc(htlc, lock_amount);
-}
-
-#[test]
-#[should_panic(expected: 'Insufficient pool balance')]
-fn test_lock_for_htlc_insufficient_balance() {
-    let owner = contract_address_const::<0x123>();
-    let htlc = contract_address_const::<0x456>();
-    let lock_amount = 5000_u256;
-    let max_lock = 10000_u256;
-
-    let token = deploy_mock_token(owner, 100000_u256);
-    let pool = deploy_pool(owner, token, max_lock);
-
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.lock_for_htlc(htlc, lock_amount);
-}
-
-#[test]
-fn test_lock_for_htlc_multiple_locks() {
-    let owner = contract_address_const::<0x123>();
-    let htlc1 = contract_address_const::<0x456>();
-    let htlc2 = contract_address_const::<0x789>();
-    let initial_supply = 100000_u256;
-    let lock_amount = 1000_u256;
-    let max_lock = 10000_u256;
-
-    let token = deploy_mock_token(owner, initial_supply);
-    let pool = deploy_pool(owner, token, max_lock);
-
-    let token_dispatcher = IERC20Dispatcher { contract_address: token };
-    start_cheat_caller_address(token, owner);
-    token_dispatcher.transfer(pool.contract_address, initial_supply);
-    stop_cheat_caller_address(token);
-
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.lock_for_htlc(htlc1, lock_amount);
-    stop_cheat_caller_address(pool.contract_address);
-
-    assert(token_dispatcher.balance_of(htlc1) == lock_amount, 'HTLC1 wrong balance');
-
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.lock_for_htlc(htlc2, lock_amount);
-    stop_cheat_caller_address(pool.contract_address);
-
-    assert(token_dispatcher.balance_of(htlc2) == lock_amount, 'HTLC2 wrong balance');
-    assert(
-        pool.get_balance() == initial_supply - (lock_amount * 2), 'Wrong pool balance after locks',
-    );
-}
-
-#[test]
-fn test_set_max_lock_success() {
-    let owner = contract_address_const::<0x123>();
-    let token = deploy_mock_token(owner, 1000_u256);
-    let initial_max = 10000_u256;
-    let new_max = 20000_u256;
-
-    let pool = deploy_pool(owner, token, initial_max);
-
-    assert(pool.get_max_lock() == initial_max, 'Wrong initial max');
-
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.set_max_lock(new_max);
-    stop_cheat_caller_address(pool.contract_address);
-
-    assert(pool.get_max_lock() == new_max, 'Max not updated');
+    spy.assert_emitted(@array![(pool.contract_address, Event::TokenAdded(TokenAdded { token }))]);
 }
 
 #[test]
 #[should_panic(expected: 'Caller is not the owner')]
-fn test_set_max_lock_not_owner() {
+fn test_add_supported_token_not_owner() {
     let owner = contract_address_const::<0x123>();
     let non_owner = contract_address_const::<0x999>();
-    let token = deploy_mock_token(owner, 1000_u256);
-    let max_lock = 10000_u256;
-
-    let pool = deploy_pool(owner, token, max_lock);
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(owner, 1000000_u256);
 
     start_cheat_caller_address(pool.contract_address, non_owner);
-    pool.set_max_lock(20000_u256);
+    pool.add_supported_token(token);
 }
 
 #[test]
-#[should_panic(expected: 'Max lock must be positive')]
-fn test_set_max_lock_zero() {
+#[should_panic(expected: 'Invalid token')]
+fn test_add_supported_token_zero_address() {
     let owner = contract_address_const::<0x123>();
-    let token = deploy_mock_token(owner, 1000_u256);
-    let max_lock = 10000_u256;
-
-    let pool = deploy_pool(owner, token, max_lock);
+    let pool = deploy_pool(owner);
+    let zero_token = contract_address_const::<0x0>();
 
     start_cheat_caller_address(pool.contract_address, owner);
-    pool.set_max_lock(0_u256);
+    pool.add_supported_token(zero_token);
 }
 
 #[test]
-fn test_withdraw_success() {
+#[should_panic(expected: 'Token already supported')]
+fn test_add_supported_token_duplicate() {
     let owner = contract_address_const::<0x123>();
-    let recipient = contract_address_const::<0x456>();
-    let initial_supply = 100000_u256;
-    let withdraw_amount = 5000_u256;
-    let max_lock = 10000_u256;
-
-    let token = deploy_mock_token(owner, initial_supply);
-    let pool = deploy_pool(owner, token, max_lock);
-
-    let token_dispatcher = IERC20Dispatcher { contract_address: token };
-    start_cheat_caller_address(token, owner);
-    token_dispatcher.transfer(pool.contract_address, initial_supply);
-    stop_cheat_caller_address(token);
-
-    assert(pool.get_balance() == initial_supply, 'Wrong pool balance');
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(owner, 1000000_u256);
 
     start_cheat_caller_address(pool.contract_address, owner);
-    pool.withdraw(recipient, withdraw_amount);
+    pool.add_supported_token(token);
+    pool.add_supported_token(token);
+}
+
+#[test]
+fn test_remove_supported_token_success() {
+    let owner = contract_address_const::<0x123>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(owner, 1000000_u256);
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.add_supported_token(token);
+    assert(pool.is_token_supported(token), 'Token not added');
+
+    let mut spy = spy_events();
+    pool.remove_supported_token(token);
     stop_cheat_caller_address(pool.contract_address);
 
-    assert(pool.get_balance() == initial_supply - withdraw_amount, 'Wrong pool balance after');
-    assert(token_dispatcher.balance_of(recipient) == withdraw_amount, 'Recipient wrong balance');
+    assert(!pool.is_token_supported(token), 'Token not removed');
+
+    spy
+        .assert_emitted(
+            @array![(pool.contract_address, Event::TokenRemoved(TokenRemoved { token }))],
+        );
+}
+
+#[test]
+#[should_panic(expected: 'Token not supported')]
+fn test_remove_unsupported_token() {
+    let owner = contract_address_const::<0x123>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(owner, 1000000_u256);
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.remove_supported_token(token);
+}
+
+#[test]
+fn test_deposit_success() {
+    let owner = contract_address_const::<0x123>();
+    let user = contract_address_const::<0x456>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(user, 1000000_u256);
+    let amount = 9000_u256;
+    let blinding = 12345_felt252;
+    let commitment = generate_commitment(amount, blinding);
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.add_supported_token(token);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let token_dispatcher = IERC20Dispatcher { contract_address: token };
+    start_cheat_caller_address(token, user);
+    token_dispatcher.approve(pool.contract_address, amount);
+    stop_cheat_caller_address(token);
+
+    let mut spy = spy_events();
+    let leaf_index = pool.get_next_leaf_index();
+
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.deposit(token, commitment, amount);
+    stop_cheat_caller_address(pool.contract_address);
+
+    assert(pool.get_balance(token) == amount, 'Wrong pool balance');
+
+    spy
+        .assert_emitted(
+            @array![
+                (
+                    pool.contract_address,
+                    Event::Deposit(Deposit { commitment, leaf_index, timestamp: get_block_timestamp() }),
+                ),
+            ],
+        );
+}
+
+#[test]
+#[should_panic(expected: 'Amount exceeds limit')]
+fn test_deposit_exceeds_max_amount() {
+    let owner = contract_address_const::<0x123>();
+    let user = contract_address_const::<0x456>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(user, 20000000000000000000000_u256);
+    let amount = 10000000000000000000001_u256;
+    let commitment = generate_commitment(amount, 123_felt252);
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.add_supported_token(token);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let token_dispatcher = IERC20Dispatcher { contract_address: token };
+    start_cheat_caller_address(token, user);
+    token_dispatcher.approve(pool.contract_address, amount);
+    stop_cheat_caller_address(token);
+
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.deposit(token, commitment, amount);
+}
+
+#[test]
+fn test_deposit_at_max_amount() {
+    let owner = contract_address_const::<0x123>();
+    let user = contract_address_const::<0x456>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(user, 20000000000000000000000_u256);
+    let amount = 10000000000000000000000_u256;
+    let commitment = generate_commitment(amount, 123_felt252);
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.add_supported_token(token);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let token_dispatcher = IERC20Dispatcher { contract_address: token };
+    start_cheat_caller_address(token, user);
+    token_dispatcher.approve(pool.contract_address, amount);
+    stop_cheat_caller_address(token);
+
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.deposit(token, commitment, amount);
+    stop_cheat_caller_address(pool.contract_address);
+
+    assert(pool.get_balance(token) == amount, 'Wrong pool balance');
+}
+
+#[test]
+#[should_panic(expected: 'Token not supported')]
+fn test_deposit_unsupported_token() {
+    let owner = contract_address_const::<0x123>();
+    let user = contract_address_const::<0x456>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(user, 1000000_u256);
+    let commitment = generate_commitment(1000_u256, 123_felt252);
+
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.deposit(token, commitment, 1000_u256);
+}
+
+#[test]
+#[should_panic(expected: 'Zero amount')]
+fn test_deposit_zero_amount() {
+    let owner = contract_address_const::<0x123>();
+    let user = contract_address_const::<0x456>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(user, 1000000_u256);
+    let commitment = generate_commitment(0_u256, 123_felt252);
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.add_supported_token(token);
+    stop_cheat_caller_address(pool.contract_address);
+
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.deposit(token, commitment, 0_u256);
+}
+
+#[test]
+fn test_create_htlc_success() {
+    let owner = contract_address_const::<0x123>();
+    let user = contract_address_const::<0x456>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(user, 1000000_u256);
+    let amount = 9000_u256;
+    let blinding = 12345_felt252;
+    let commitment = generate_commitment(amount, blinding);
+    let secret = 99999_felt252;
+    let hash_lock = generate_hash_lock(secret);
+    let nullifier = 55555_felt252;
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.add_supported_token(token);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let token_dispatcher = IERC20Dispatcher { contract_address: token };
+    start_cheat_caller_address(token, user);
+    token_dispatcher.approve(pool.contract_address, amount);
+    stop_cheat_caller_address(token);
+
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.deposit(token, commitment, amount);
+    stop_cheat_caller_address(pool.contract_address);
+
+    // For single-leaf tree, root IS the commitment itself
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.update_merkle_root(commitment);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let current_time = 1000000_u64;
+    start_cheat_block_timestamp(pool.contract_address, current_time);
+    let timelock = current_time + 7200;
+
+    // Empty proof for single-leaf tree (leaf == root, no proof needed)
+    let merkle_proof: Array<felt252> = array![];
+    let path_indices: Array<u8> = array![];
+
+    let mut spy = spy_events();
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.create_htlc(token, nullifier, commitment, commitment, amount, merkle_proof.span(), path_indices.span(), hash_lock, timelock);
+    stop_cheat_caller_address(pool.contract_address);
+    stop_cheat_block_timestamp(pool.contract_address);
+
+    let (stored_root, stored_token, stored_hash, stored_timelock, stored_amount, state) = pool
+        .get_htlc(nullifier);
+    assert(stored_root == commitment, 'Wrong root');
+    assert(stored_token == token, 'Wrong token');
+    assert(stored_hash == hash_lock, 'Wrong hash lock');
+    assert(stored_timelock == timelock, 'Wrong timelock');
+    assert(stored_amount == amount, 'Wrong amount');
+    assert(state == 0, 'Wrong initial state');
+
+    spy
+        .assert_emitted(
+            @array![
+                (
+                    pool.contract_address,
+                    Event::HTLCCreated(
+                        HTLCCreated {
+                            nullifier, hash_lock, timelock, timestamp: current_time,
+                        },
+                    ),
+                ),
+            ],
+        );
+}
+
+#[test]
+#[should_panic(expected: 'Caller is not the owner')]
+fn test_create_htlc_not_owner() {
+    let owner = contract_address_const::<0x123>();
+    let user = contract_address_const::<0x456>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(user, 1000000_u256);
+    let amount = 5000_u256;
+    let commitment = generate_commitment(amount, 123_felt252);
+    let hash_lock = generate_hash_lock(999_felt252);
+    let nullifier = 55555_felt252;
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.add_supported_token(token);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let token_dispatcher = IERC20Dispatcher { contract_address: token };
+    start_cheat_caller_address(token, user);
+    token_dispatcher.approve(pool.contract_address, amount);
+    stop_cheat_caller_address(token);
+
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.deposit(token, commitment, amount);
+    stop_cheat_caller_address(pool.contract_address);
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.update_merkle_root(commitment);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let current_time = 1000000_u64;
+    start_cheat_block_timestamp(pool.contract_address, current_time);
+    
+    let merkle_proof: Array<felt252> = array![];
+    let path_indices: Array<u8> = array![];
+
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.create_htlc(token, nullifier, commitment, commitment, amount, merkle_proof.span(), path_indices.span(), hash_lock, current_time + 7200);
+}
+
+#[test]
+#[should_panic(expected: 'Amount exceeds limit')]
+fn test_create_htlc_exceeds_max_amount() {
+    let owner = contract_address_const::<0x123>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(owner, 20000000000000000000000_u256);
+    let amount = 10000000000000000000001_u256;
+    let commitment = generate_commitment(amount, 123_felt252);
+    let hash_lock = generate_hash_lock(999_felt252);
+    let nullifier = 55555_felt252;
+    let root = pool.get_current_root();
+    let merkle_proof: Array<felt252> = array![];
+    let path_indices: Array<u8> = array![];
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.add_supported_token(token);
+
+    let current_time = 1000000_u64;
+    start_cheat_block_timestamp(pool.contract_address, current_time);
+    pool.create_htlc(token, nullifier, root, commitment, amount, merkle_proof.span(), path_indices.span(), hash_lock, current_time + 7200);
+}
+
+#[test]
+fn test_withdraw_redemption_with_secret() {
+    let owner = contract_address_const::<0x123>();
+    let user = contract_address_const::<0x456>();
+    let recipient = contract_address_const::<0x789>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(user, 1000000_u256);
+    let amount = 8000_u256;
+    let blinding = 12345_felt252;
+    let commitment = generate_commitment(amount, blinding);
+    let secret = 99999_felt252;
+    let hash_lock = generate_hash_lock(secret);
+    let nullifier = 55555_felt252;
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.add_supported_token(token);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let token_dispatcher = IERC20Dispatcher { contract_address: token };
+    start_cheat_caller_address(token, user);
+    token_dispatcher.approve(pool.contract_address, amount);
+    stop_cheat_caller_address(token);
+
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.deposit(token, commitment, amount);
+    stop_cheat_caller_address(pool.contract_address);
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.update_merkle_root(commitment);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let current_time = 1000000_u64;
+    start_cheat_block_timestamp(pool.contract_address, current_time);
+    let timelock = current_time + 7200;
+    
+    let merkle_proof: Array<felt252> = array![];
+    let path_indices: Array<u8> = array![];
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.create_htlc(token, nullifier, commitment, commitment, amount, merkle_proof.span(), path_indices.span(), hash_lock, timelock);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let mut spy = spy_events();
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.withdraw(token, nullifier, recipient, Option::Some(secret));
+    stop_cheat_caller_address(pool.contract_address);
+    stop_cheat_block_timestamp(pool.contract_address);
+
+    assert(pool.is_nullifier_spent(nullifier), 'Nullifier not spent');
+    assert(token_dispatcher.balance_of(recipient) == amount, 'Wrong recipient balance');
+    assert(pool.get_balance(token) == 0, 'Pool not empty');
+
+    let (_, _, _, _, _, state) = pool.get_htlc(nullifier);
+    assert(state == 1, 'Wrong state (redeem)');
+
+    spy
+        .assert_emitted(
+            @array![
+                (
+                    pool.contract_address,
+                    Event::Withdrawal(Withdrawal { nullifier, timestamp: current_time }),
+                ),
+            ],
+        );
 }
 
 #[test]
 #[should_panic(expected: 'Caller is not the owner')]
 fn test_withdraw_not_owner() {
     let owner = contract_address_const::<0x123>();
-    let non_owner = contract_address_const::<0x999>();
-    let recipient = contract_address_const::<0x456>();
-    let max_lock = 10000_u256;
-
-    let token = deploy_mock_token(owner, 100000_u256);
-    let pool = deploy_pool(owner, token, max_lock);
-
-    start_cheat_caller_address(pool.contract_address, non_owner);
-    pool.withdraw(recipient, 1000_u256);
-}
-
-#[test]
-#[should_panic(expected: 'Invalid recipient address')]
-fn test_withdraw_zero_recipient() {
-    let owner = contract_address_const::<0x123>();
-    let recipient = contract_address_const::<0x0>();
-    let max_lock = 10000_u256;
-
-    let token = deploy_mock_token(owner, 100000_u256);
-    let pool = deploy_pool(owner, token, max_lock);
-
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.withdraw(recipient, 1000_u256);
-}
-
-#[test]
-#[should_panic(expected: 'Amount must be positive')]
-fn test_withdraw_zero_amount() {
-    let owner = contract_address_const::<0x123>();
-    let recipient = contract_address_const::<0x456>();
-    let max_lock = 10000_u256;
-
-    let token = deploy_mock_token(owner, 100000_u256);
-    let pool = deploy_pool(owner, token, max_lock);
-
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.withdraw(recipient, 0_u256);
-}
-
-#[test]
-#[should_panic(expected: 'Insufficient pool balance')]
-fn test_withdraw_insufficient_balance() {
-    let owner = contract_address_const::<0x123>();
-    let recipient = contract_address_const::<0x456>();
-    let max_lock = 10000_u256;
-
-    let token = deploy_mock_token(owner, 100000_u256);
-    let pool = deploy_pool(owner, token, max_lock);
-
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.withdraw(recipient, 1000_u256);
-}
-
-#[test]
-fn test_withdraw_full_balance() {
-    let owner = contract_address_const::<0x123>();
-    let recipient = contract_address_const::<0x456>();
-    let initial_supply = 100000_u256;
-    let max_lock = 10000_u256;
-
-    let token = deploy_mock_token(owner, initial_supply);
-    let pool = deploy_pool(owner, token, max_lock);
-
-    let token_dispatcher = IERC20Dispatcher { contract_address: token };
-    start_cheat_caller_address(token, owner);
-    token_dispatcher.transfer(pool.contract_address, initial_supply);
-    stop_cheat_caller_address(token);
-
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.withdraw(recipient, initial_supply);
-    stop_cheat_caller_address(pool.contract_address);
-
-    assert(pool.get_balance() == 0, 'Pool should be empty');
-    assert(token_dispatcher.balance_of(recipient) == initial_supply, 'Recipient wrong balance');
-}
-
-#[test]
-fn test_get_balance_empty() {
-    let owner = contract_address_const::<0x123>();
-    let token = deploy_mock_token(owner, 1000_u256);
-    let max_lock = 10000_u256;
-
-    let pool = deploy_pool(owner, token, max_lock);
-
-    assert(pool.get_balance() == 0, 'Balance should be zero');
-}
-
-#[test]
-fn test_get_balance_after_funding() {
-    let owner = contract_address_const::<0x123>();
-    let funding_amount = 50000_u256;
-    let max_lock = 10000_u256;
-
-    let token = deploy_mock_token(owner, 100000_u256);
-    let pool = deploy_pool(owner, token, max_lock);
-
-    let token_dispatcher = IERC20Dispatcher { contract_address: token };
-    start_cheat_caller_address(token, owner);
-    token_dispatcher.transfer(pool.contract_address, funding_amount);
-    stop_cheat_caller_address(token);
-
-    assert(pool.get_balance() == funding_amount, 'Wrong balance');
-}
-
-#[test]
-fn test_full_lifecycle() {
-    let owner = contract_address_const::<0x123>();
-    let htlc = contract_address_const::<0x456>();
+    let user = contract_address_const::<0x456>();
     let recipient = contract_address_const::<0x789>();
-    let initial_supply = 100000_u256;
-    let lock_amount = 5000_u256;
-    let withdraw_amount = 3000_u256;
-    let max_lock = 10000_u256;
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(user, 1000000_u256);
+    let amount = 5000_u256;
+    let commitment = generate_commitment(amount, 123_felt252);
+    let secret = 99999_felt252;
+    let hash_lock = generate_hash_lock(secret);
+    let nullifier = 55555_felt252;
 
-    let token = deploy_mock_token(owner, initial_supply);
-    let pool = deploy_pool(owner, token, max_lock);
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.add_supported_token(token);
+    stop_cheat_caller_address(pool.contract_address);
+
     let token_dispatcher = IERC20Dispatcher { contract_address: token };
-
-    // 1. Fund pool
-    start_cheat_caller_address(token, owner);
-    token_dispatcher.transfer(pool.contract_address, initial_supply);
+    start_cheat_caller_address(token, user);
+    token_dispatcher.approve(pool.contract_address, amount);
     stop_cheat_caller_address(token);
-    assert(pool.get_balance() == initial_supply, 'Step 1 failed');
 
-    // 2. Lock for HTLC
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.lock_for_htlc(htlc, lock_amount);
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.deposit(token, commitment, amount);
     stop_cheat_caller_address(pool.contract_address);
-    assert(pool.get_balance() == initial_supply - lock_amount, 'Step 2 failed');
 
-    // 3. Withdraw some funds
     start_cheat_caller_address(pool.contract_address, owner);
-    pool.withdraw(recipient, withdraw_amount);
+    pool.update_merkle_root(commitment);
     stop_cheat_caller_address(pool.contract_address);
+
+    let current_time = 1000000_u64;
+    start_cheat_block_timestamp(pool.contract_address, current_time);
+    
+    let merkle_proof: Array<felt252> = array![];
+    let path_indices: Array<u8> = array![];
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.create_htlc(token, nullifier, commitment, commitment, amount, merkle_proof.span(), path_indices.span(), hash_lock, current_time + 7200);
+    stop_cheat_caller_address(pool.contract_address);
+
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.withdraw(token, nullifier, recipient, Option::Some(secret));
+}
+
+#[test]
+fn test_withdraw_refund_after_expiry() {
+    let owner = contract_address_const::<0x123>();
+    let user = contract_address_const::<0x456>();
+    let recipient = contract_address_const::<0x789>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(user, 1000000_u256);
+    let amount = 7000_u256;
+    let commitment = generate_commitment(amount, 123_felt252);
+    let hash_lock = generate_hash_lock(999_felt252);
+    let nullifier = 55555_felt252;
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.add_supported_token(token);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let token_dispatcher = IERC20Dispatcher { contract_address: token };
+    start_cheat_caller_address(token, user);
+    token_dispatcher.approve(pool.contract_address, amount);
+    stop_cheat_caller_address(token);
+
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.deposit(token, commitment, amount);
+    stop_cheat_caller_address(pool.contract_address);
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.update_merkle_root(commitment);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let current_time = 1000000_u64;
+    start_cheat_block_timestamp(pool.contract_address, current_time);
+    let timelock = current_time + 7200;
+    
+    let merkle_proof: Array<felt252> = array![];
+    let path_indices: Array<u8> = array![];
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.create_htlc(token, nullifier, commitment, commitment, amount, merkle_proof.span(), path_indices.span(), hash_lock, timelock);
+    stop_cheat_caller_address(pool.contract_address);
+    stop_cheat_block_timestamp(pool.contract_address);
+
+    start_cheat_block_timestamp(pool.contract_address, timelock + 1);
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.withdraw(token, nullifier, recipient, Option::None);
+    stop_cheat_caller_address(pool.contract_address);
+
+    assert(pool.is_nullifier_spent(nullifier), 'Nullifier not spent');
+    let (_, _, _, _, _, state) = pool.get_htlc(nullifier);
+    assert(state == 2, 'Wrong state (refund)');
+}
+
+#[test]
+#[should_panic(expected: 'Invalid secret')]
+fn test_withdraw_wrong_secret() {
+    let owner = contract_address_const::<0x123>();
+    let user = contract_address_const::<0x456>();
+    let recipient = contract_address_const::<0x789>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(user, 1000000_u256);
+    let amount = 6000_u256;
+    let commitment = generate_commitment(amount, 123_felt252);
+    let correct_secret = 99999_felt252;
+    let wrong_secret = 11111_felt252;
+    let hash_lock = generate_hash_lock(correct_secret);
+    let nullifier = 55555_felt252;
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.add_supported_token(token);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let token_dispatcher = IERC20Dispatcher { contract_address: token };
+    start_cheat_caller_address(token, user);
+    token_dispatcher.approve(pool.contract_address, amount);
+    stop_cheat_caller_address(token);
+
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.deposit(token, commitment, amount);
+    stop_cheat_caller_address(pool.contract_address);
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.update_merkle_root(commitment);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let current_time = 1000000_u64;
+    start_cheat_block_timestamp(pool.contract_address, current_time);
+    let timelock = current_time + 7200;
+    
+    let merkle_proof: Array<felt252> = array![];
+    let path_indices: Array<u8> = array![];
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.create_htlc(token, nullifier, commitment, commitment, amount, merkle_proof.span(), path_indices.span(), hash_lock, timelock);
+    pool.withdraw(token, nullifier, recipient, Option::Some(wrong_secret));
+}
+
+#[test]
+#[should_panic(expected: 'Already spent')]
+fn test_withdraw_double_spend() {
+    let owner = contract_address_const::<0x123>();
+    let user = contract_address_const::<0x456>();
+    let recipient = contract_address_const::<0x789>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(user, 1000000_u256);
+    let amount = 5500_u256;
+    let commitment = generate_commitment(amount, 123_felt252);
+    let secret = 99999_felt252;
+    let hash_lock = generate_hash_lock(secret);
+    let nullifier = 55555_felt252;
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.add_supported_token(token);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let token_dispatcher = IERC20Dispatcher { contract_address: token };
+    start_cheat_caller_address(token, user);
+    token_dispatcher.approve(pool.contract_address, amount);
+    stop_cheat_caller_address(token);
+
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.deposit(token, commitment, amount);
+    stop_cheat_caller_address(pool.contract_address);
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.update_merkle_root(commitment);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let current_time = 1000000_u64;
+    start_cheat_block_timestamp(pool.contract_address, current_time);
+    let timelock = current_time + 7200;
+
+    let merkle_proof: Array<felt252> = array![];
+    let path_indices: Array<u8> = array![];
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.create_htlc(token, nullifier, commitment, commitment, amount, merkle_proof.span(), path_indices.span(), hash_lock, timelock);
+    pool.withdraw(token, nullifier, recipient, Option::Some(secret));
+    pool.withdraw(token, nullifier, recipient, Option::Some(secret));
+}
+
+#[test]
+fn test_emergency_withdraw_success() {
+    let owner = contract_address_const::<0x123>();
+    let user = contract_address_const::<0x456>();
+    let emergency_recipient = contract_address_const::<0x999>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(user, 1000000_u256);
+    let amount = 9000_u256;
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.add_supported_token(token);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let token_dispatcher = IERC20Dispatcher { contract_address: token };
+    start_cheat_caller_address(token, user);
+    token_dispatcher.approve(pool.contract_address, amount);
+    stop_cheat_caller_address(token);
+
+    let commitment = generate_commitment(amount, 123_felt252);
+    start_cheat_caller_address(pool.contract_address, user);
+    pool.deposit(token, commitment, amount);
+    stop_cheat_caller_address(pool.contract_address);
+
+    let withdraw_amount = 5000_u256;
+    let mut spy = spy_events();
+
+    start_cheat_caller_address(pool.contract_address, owner);
+    pool.emergency_withdraw(token, emergency_recipient, withdraw_amount);
+    stop_cheat_caller_address(pool.contract_address);
+
+    assert(pool.get_balance(token) == amount - withdraw_amount, 'Wrong pool balance');
     assert(
-        pool.get_balance() == initial_supply - lock_amount - withdraw_amount, 'Step 3 failed'
+        token_dispatcher.balance_of(emergency_recipient) == withdraw_amount,
+        'Wrong recipient balance',
     );
 
-    // 4. Update max lock
-    let new_max = 20000_u256;
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.set_max_lock(new_max);
-    stop_cheat_caller_address(pool.contract_address);
-    assert(pool.get_max_lock() == new_max, 'Step 4 failed');
-
-    // 5. Verify final balances
-    assert(token_dispatcher.balance_of(htlc) == lock_amount, 'HTLC balance wrong');
-    assert(token_dispatcher.balance_of(recipient) == withdraw_amount, 'Recipient balance wrong');
+    spy
+        .assert_emitted(
+            @array![
+                (
+                    pool.contract_address,
+                    Event::EmergencyWithdraw(
+                        EmergencyWithdraw {
+                            token, to: emergency_recipient, amount: withdraw_amount,
+                        },
+                    ),
+                ),
+            ],
+        );
 }
 
 #[test]
-fn test_max_lock_enforcement() {
+#[should_panic(expected: 'Caller is not the owner')]
+fn test_emergency_withdraw_not_owner() {
     let owner = contract_address_const::<0x123>();
-    let htlc = contract_address_const::<0x456>();
-    let initial_supply = 100000_u256;
-    let max_lock = 5000_u256;
+    let non_owner = contract_address_const::<0x999>();
+    let pool = deploy_pool(owner);
+    let token = deploy_mock_token(owner, 1000000_u256);
 
-    let token = deploy_mock_token(owner, initial_supply);
-    let pool = deploy_pool(owner, token, max_lock);
+    start_cheat_caller_address(pool.contract_address, non_owner);
+    pool.emergency_withdraw(token, owner, 1000_u256);
+}
 
-    // Fund pool
-    let token_dispatcher = IERC20Dispatcher { contract_address: token };
-    start_cheat_caller_address(token, owner);
-    token_dispatcher.transfer(pool.contract_address, initial_supply);
-    stop_cheat_caller_address(token);
+#[test]
+fn test_multi_token_support() {
+    let owner = contract_address_const::<0x123>();
+    let user1 = contract_address_const::<0x456>();
+    let user2 = contract_address_const::<0x789>();
+    let pool = deploy_pool(owner);
+    let token1 = deploy_mock_token(user1, 1000000_u256);
+    let token2 = deploy_mock_token(user2, 1000000_u256);
+    let amount1 = 5000_u256;
+    let amount2 = 7000_u256;
 
-    // Lock at max limit (should succeed)
     start_cheat_caller_address(pool.contract_address, owner);
-    pool.lock_for_htlc(htlc, max_lock);
-    stop_cheat_caller_address(pool.contract_address);
-    assert(token_dispatcher.balance_of(htlc) == max_lock, 'Max lock failed');
-
-    // Increase max lock
-    let new_max = 10000_u256;
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.set_max_lock(new_max);
+    pool.add_supported_token(token1);
+    pool.add_supported_token(token2);
     stop_cheat_caller_address(pool.contract_address);
 
-    // Now can lock more
-    let htlc2 = contract_address_const::<0xABC>();
-    start_cheat_caller_address(pool.contract_address, owner);
-    pool.lock_for_htlc(htlc2, new_max);
+    let commitment1 = generate_commitment(amount1, 111_felt252);
+    let token1_dispatcher = IERC20Dispatcher { contract_address: token1 };
+    start_cheat_caller_address(token1, user1);
+    token1_dispatcher.approve(pool.contract_address, amount1);
+    stop_cheat_caller_address(token1);
+
+    start_cheat_caller_address(pool.contract_address, user1);
+    pool.deposit(token1, commitment1, amount1);
     stop_cheat_caller_address(pool.contract_address);
-    assert(token_dispatcher.balance_of(htlc2) == new_max, 'New max lock failed');
+
+    let commitment2 = generate_commitment(amount2, 222_felt252);
+    let token2_dispatcher = IERC20Dispatcher { contract_address: token2 };
+    start_cheat_caller_address(token2, user2);
+    token2_dispatcher.approve(pool.contract_address, amount2);
+    stop_cheat_caller_address(token2);
+
+    start_cheat_caller_address(pool.contract_address, user2);
+    pool.deposit(token2, commitment2, amount2);
+    stop_cheat_caller_address(pool.contract_address);
+
+    assert(pool.get_balance(token1) == amount1, 'Wrong token1 balance');
+    assert(pool.get_balance(token2) == amount2, 'Wrong token2 balance');
 }

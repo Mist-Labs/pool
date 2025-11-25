@@ -1,3 +1,4 @@
-pub mod pool;
+pub mod standard_shielded_pool;
 pub mod interface;
-pub mod mock_token;
+pub mod veil_token;
+pub mod fast_shielded_pool;
