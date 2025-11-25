@@ -123,7 +123,7 @@ Full-featured shielded pool with **unlimited deposits** for maximum privacy and 
 
 ## 📜 License
 
-MIT
+Apache 2.0
 
 ---
 
