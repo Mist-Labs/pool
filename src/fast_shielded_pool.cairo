@@ -34,6 +34,7 @@ pub mod FastPool {
         root_history_index: u32,
         known_roots: Map<felt252, bool>,
         next_leaf_index: u32,
+        pool_type: felt252,
         htlcs: Map<felt252, VirtualHTLC>,
         #[substorage(v0)]
         ownable: OwnableComponent::Storage,
@@ -72,6 +73,7 @@ pub mod FastPool {
         #[key]
         pub commitment: felt252,
         pub leaf_index: u32,
+        pub pool_type: felt252,
         pub timestamp: u64,
     }
 
@@ -81,6 +83,7 @@ pub mod FastPool {
         pub nullifier: felt252,
         pub hash_lock: felt252,
         pub timelock: u64,
+        pub pool_type: felt252,
         pub timestamp: u64,
     }
 
@@ -125,6 +128,7 @@ pub mod FastPool {
         self.current_root.write(0);
         self.root_history_index.write(0);
         self.next_leaf_index.write(0);
+        self.pool_type.write('0');
     }
 
     #[generate_trait]
@@ -205,8 +209,9 @@ pub mod FastPool {
             let success = token_dispatcher.transfer_from(caller, get_contract_address(), amount);
             assert(success, 'Transfer failed');
 
+            let pool_type = self.pool_type.read();
             let leaf_index = self.next_leaf_index.read();
-            self.emit(Deposit { commitment, leaf_index, timestamp: get_block_timestamp() });
+            self.emit(Deposit { commitment, leaf_index, pool_type, timestamp: get_block_timestamp() });
 
             self.next_leaf_index.write(leaf_index + 1);
 
@@ -254,11 +259,12 @@ pub mod FastPool {
             let htlc = VirtualHTLC { root, token, hash_lock, timelock, amount, state: 0 };
 
             self.htlcs.write(nullifier, htlc);
+            let pool_type = self.pool_type.read();
 
             self
                 .emit(
                     HTLCCreated {
-                        nullifier, hash_lock, timelock, timestamp: get_block_timestamp(),
+                        nullifier, hash_lock, timelock, pool_type, timestamp: get_block_timestamp(),
                     },
                 );
 
