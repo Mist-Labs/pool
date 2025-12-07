@@ -142,6 +142,7 @@ fn test_deposit_success() {
     let amount = 9000_u256;
     let blinding = 12345_felt252;
     let commitment = generate_commitment(amount, blinding);
+    let pool_type = '0';
 
     start_cheat_caller_address(pool.contract_address, owner);
     pool.add_supported_token(token);
@@ -166,7 +167,7 @@ fn test_deposit_success() {
             @array![
                 (
                     pool.contract_address,
-                    Event::Deposit(Deposit { commitment, leaf_index, timestamp: get_block_timestamp() }),
+                    Event::Deposit(Deposit { commitment, leaf_index, pool_type, timestamp: get_block_timestamp() }),
                 ),
             ],
         );
@@ -262,6 +263,7 @@ fn test_create_htlc_success() {
     let secret = 99999_felt252;
     let hash_lock = generate_hash_lock(secret);
     let nullifier = 55555_felt252;
+    let pool_type = '1';
 
     start_cheat_caller_address(pool.contract_address, owner);
     pool.add_supported_token(token);
@@ -311,7 +313,7 @@ fn test_create_htlc_success() {
                     pool.contract_address,
                     Event::HTLCCreated(
                         HTLCCreated {
-                            nullifier, hash_lock, timelock, timestamp: current_time,
+                            nullifier, hash_lock, timelock, pool_type, timestamp: current_time,
                         },
                     ),
                 ),
